@@ -216,7 +216,8 @@ class Commands:
                               passphrase=passphrase,
                               password=password,
                               encrypt_file=encrypt_file,
-                              seed_type=seed_type)
+                              seed_type=seed_type,
+                              config=self.config)
         return {
             'seed': d['seed'],
             'path': d['wallet'].storage.path,
@@ -235,7 +236,8 @@ class Commands:
                                      path=wallet_path,
                                      passphrase=passphrase,
                                      password=password,
-                                     encrypt_file=encrypt_file)
+                                     encrypt_file=encrypt_file,
+                                     config=self.config)
         return {
             'path': d['wallet'].storage.path,
             'msg': d['msg'],
@@ -528,20 +530,22 @@ class Commands:
         message = util.to_bytes(message)
         return ecc.verify_message_with_address(address, sig, message)
 
-    def _mktx(self, wallet: Abstract_Wallet, outputs, *, fee=None, feerate=None, change_addr=None, domain=None,
+    def _mktx(self, wallet: Abstract_Wallet, outputs, *, fee=None, feerate=None, change_addr=None, domain_addr=None, domain_coins=None,
               nocheck=False, unsigned=False, rbf=None, password=None, locktime=None):
         if fee is not None and feerate is not None:
             raise Exception("Cannot specify both 'fee' and 'feerate' at the same time!")
         self.nocheck = nocheck
         change_addr = self._resolver(change_addr, wallet)
-        domain = None if domain is None else map(self._resolver, domain)
+        domain_addr = None if domain_addr is None else map(self._resolver, domain_addr)
         final_outputs = []
         for address, amount in outputs:
             address = self._resolver(address, wallet)
             amount = satoshis(amount)
             final_outputs.append(TxOutput(TYPE_ADDRESS, address, amount))
 
-        coins = wallet.get_spendable_coins(domain)
+        coins = wallet.get_spendable_coins(domain_addr)
+        if domain_coins is not None:
+            coins = [coin for coin in coins if (coin['prevout_hash'] + ':' + str(coin['prevout_n']) in domain_coins)]
         if feerate is not None:
             fee_per_kb = 1000 * Decimal(feerate)
             fee_estimator = partial(SimpleConfig.estimate_fee_for_feerate, fee_per_kb)
@@ -559,17 +563,19 @@ class Commands:
         return tx
 
     @command('wp')
-    async def payto(self, destination, amount, fee=None, feerate=None, from_addr=None, change_addr=None,
+    async def payto(self, destination, amount, fee=None, feerate=None, from_addr=None, from_coins=None, change_addr=None,
                     nocheck=False, unsigned=False, rbf=None, password=None, locktime=None, wallet: Abstract_Wallet = None):
         """Create a transaction. """
         tx_fee = satoshis(fee)
-        domain = from_addr.split(',') if from_addr else None
+        domain_addr = from_addr.split(',') if from_addr else None
+        domain_coins = from_coins.split(',') if from_coins else None
         tx = self._mktx(wallet,
                         [(destination, amount)],
                         fee=tx_fee,
                         feerate=feerate,
                         change_addr=change_addr,
-                        domain=domain,
+                        domain_addr=domain_addr,
+                        domain_coins=domain_coins,
                         nocheck=nocheck,
                         unsigned=unsigned,
                         rbf=rbf,
@@ -578,17 +584,19 @@ class Commands:
         return tx.as_dict()
 
     @command('wp')
-    async def paytomany(self, outputs, fee=None, feerate=None, from_addr=None, change_addr=None,
+    async def paytomany(self, outputs, fee=None, feerate=None, from_addr=None, from_coins=None, change_addr=None,
                         nocheck=False, unsigned=False, rbf=None, password=None, locktime=None, wallet: Abstract_Wallet = None):
         """Create a multi-output transaction. """
         tx_fee = satoshis(fee)
-        domain = from_addr.split(',') if from_addr else None
+        domain_addr = from_addr.split(',') if from_addr else None
+        domain_coins = from_coins.split(',') if from_coins else None
         tx = self._mktx(wallet,
                         outputs,
                         fee=tx_fee,
                         feerate=feerate,
                         change_addr=change_addr,
-                        domain=domain,
+                        domain_addr=domain_addr,
+                        domain_coins=domain_coins,
                         nocheck=nocheck,
                         unsigned=unsigned,
                         rbf=rbf,
@@ -710,7 +718,7 @@ class Commands:
     def _format_request(self, out):
         from .util import get_request_status
         out['amount_BTC'] = format_satoshis(out.get('amount'))
-        out['status'] = get_request_status(out)
+        out['status_str'] = get_request_status(out)
         return out
 
     @command('w')
@@ -727,7 +735,7 @@ class Commands:
     #    pass
 
     @command('w')
-    async def listrequests(self, pending=False, expired=False, paid=False, wallet: Abstract_Wallet = None):
+    async def list_requests(self, pending=False, expired=False, paid=False, wallet: Abstract_Wallet = None):
         """List the payment requests you made."""
         out = wallet.get_sorted_requests()
         if pending:
@@ -754,7 +762,7 @@ class Commands:
         return wallet.get_unused_address()
 
     @command('w')
-    async def addrequest(self, amount, memo='', expiration=None, force=False, wallet: Abstract_Wallet = None):
+    async def add_request(self, amount, memo='', expiration=3600, force=False, wallet: Abstract_Wallet = None):
         """Create a payment request, using the first unused address of the wallet.
         The address will be considered as used after this operation.
         If no payment is received, the address will be considered as unused if the payment request is deleted from the wallet."""
@@ -770,6 +778,12 @@ class Commands:
         wallet.add_payment_request(req)
         out = wallet.get_request(addr)
         return self._format_request(out)
+
+    @command('wn')
+    async def add_lightning_request(self, amount, memo='', expiration=3600, wallet: Abstract_Wallet = None):
+        amount_sat = int(satoshis(amount))
+        key = await wallet.lnworker._add_request_coro(amount_sat, memo, expiration)
+        return wallet.get_request(key)['invoice']
 
     @command('w')
     async def addtransaction(self, tx, wallet: Abstract_Wallet = None):
@@ -888,13 +902,6 @@ class Commands:
     async def lnpay(self, invoice, attempts=1, timeout=10, wallet: Abstract_Wallet = None):
         return await wallet.lnworker._pay(invoice, attempts=attempts)
 
-    @command('wn')
-    async def addinvoice(self, requested_amount, message, expiration=3600, wallet: Abstract_Wallet = None):
-        # using requested_amount because it is documented in param_descriptions
-        payment_hash = await wallet.lnworker._add_invoice_coro(satoshis(requested_amount), message, expiration)
-        invoice, direction, is_paid = wallet.lnworker.invoices[bh2u(payment_hash)]
-        return invoice
-
     @command('w')
     async def nodeid(self, wallet: Abstract_Wallet = None):
         listen_addr = self.config.get('lightning_listen')
@@ -919,21 +926,8 @@ class Commands:
         self.network.path_finder.blacklist.clear()
 
     @command('w')
-    async def lightning_invoices(self, wallet: Abstract_Wallet = None):
-        from .util import pr_tooltips
-        out = []
-        for payment_hash, (preimage, invoice, is_received, timestamp) in wallet.lnworker.invoices.items():
-            status = wallet.lnworker.get_invoice_status(payment_hash)
-            item = {
-                'date':timestamp_to_datetime(timestamp),
-                'direction': 'received' if is_received else 'sent',
-                'payment_hash':payment_hash,
-                'invoice':invoice,
-                'preimage':preimage,
-                'status':pr_tooltips[status]
-            }
-            out.append(item)
-        return out
+    async def list_invoices(self, wallet: Abstract_Wallet = None):
+        return wallet.get_invoices()
 
     @command('w')
     async def lightning_history(self, wallet: Abstract_Wallet = None):
@@ -998,6 +992,7 @@ command_options = {
     'fee':         ("-f", "Transaction fee (absolute, in BTC)"),
     'feerate':     (None, "Transaction fee rate (in sat/byte)"),
     'from_addr':   ("-F", "Source address (must be a wallet address; use sweep to spend from non-wallet address)."),
+    'from_coins':  (None, "Source coins (must be in wallet; use sweep to spend from non-wallet address)."),
     'change_addr': ("-c", "Change address. Default is a spare address, or the source address if it's not in the wallet"),
     'nbits':       (None, "Number of bits of entropy"),
     'seed_type':   (None, "The type of seed to create, e.g. 'standard' or 'segwit'"),
